@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_library(MineXRay SHARED
     src/xray_dll.cpp
 )
+target_include_directories(MineXRay PRIVATE include)
 target_compile_definitions(MineXRay PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 set_target_properties(MineXRay PROPERTIES OUTPUT_NAME "MineXRay")
 
