@@ -1,0 +1,12 @@
+# MineXRay - blocos que continuam visiveis
+# Um token por linha. A comparacao e por substring.
+# "ore" mantem todos os minerios visiveis.
+
+ore
+ancient_debris
+lava
+water
+chest
+spawner
+amethyst
+vault
