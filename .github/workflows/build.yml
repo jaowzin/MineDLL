@@ -1,0 +1,38 @@
+name: Build MineXRay
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure x64
+        run: cmake -S . -B build -A x64
+
+      - name: Build Release
+        run: cmake --build build --config Release --parallel
+
+      - name: Prepare package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item build/Release/MineXRay.dll package/MineXRay.dll
+          Copy-Item build/Release/MineXRayInjector.exe package/MineXRayInjector.exe
+          Copy-Item xray-blocks.txt package/xray-blocks.txt
+          Copy-Item README.md package/README.md
+          if (Test-Path build/Release/MineXRay.pdb) { Copy-Item build/Release/MineXRay.pdb package/MineXRay.pdb }
+          if (Test-Path build/Release/MineXRayInjector.pdb) { Copy-Item build/Release/MineXRayInjector.pdb package/MineXRayInjector.pdb }
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: MineDLL-XRay-win64
+          path: package/*
+          if-no-files-found: error
