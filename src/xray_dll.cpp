@@ -1,5 +1,7 @@
 #include <windows.h>
 
+#include "MineXRayCore.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -11,11 +13,12 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <set>
 #include <string>
 #include <vector>
 
 namespace {
+
+namespace ox = mine_mod::xray::offsets_1_26_4501;
 
 HMODULE g_self = nullptr;
 HMODULE g_minecraft = nullptr;
@@ -49,7 +52,6 @@ void logLine(const char* format, ...) {
 
     OutputDebugStringA(buffer);
     OutputDebugStringA("\n");
-
     if (g_log) {
         std::fprintf(g_log, "%s\n", buffer);
         std::fflush(g_log);
@@ -182,6 +184,21 @@ bool safeReadInt32(const void* address, std::int32_t& value) {
 #endif
 }
 
+void* safeCallPtr(void* object, std::size_t index) {
+    if (!object) return nullptr;
+#if defined(_MSC_VER)
+    __try {
+        auto** table = *reinterpret_cast<void***>(object);
+        using Fn = void*(__fastcall*)(void*);
+        return reinterpret_cast<Fn>(table[index])(object);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+#else
+    return nullptr;
+#endif
+}
+
 bool copyMsvcString(const void* stringObject, char* output, std::size_t outputCapacity) {
     if (!output || outputCapacity < 2) return false;
     output[0] = '\0';
@@ -194,12 +211,9 @@ bool copyMsvcString(const void* stringObject, char* output, std::size_t outputCa
         if (length == 0 || length >= outputCapacity || length > 255) return false;
         if (capacity < length) return false;
 
-        const char* data = nullptr;
-        if (capacity < 16) {
-            data = reinterpret_cast<const char*>(base);
-        } else {
-            data = *reinterpret_cast<const char* const*>(base);
-        }
+        const char* data = capacity < 16
+            ? reinterpret_cast<const char*>(base)
+            : *reinterpret_cast<const char* const*>(base);
         if (!data || !isReadableRange(data, length)) return false;
 
         std::memcpy(output, data, length);
@@ -217,7 +231,6 @@ bool plausibleBlockName(const char* text) {
     if (!text || !*text) return false;
     const std::size_t length = std::strlen(text);
     if (length < 2 || length > 200) return false;
-
     for (std::size_t i = 0; i < length; ++i) {
         const unsigned char ch = static_cast<unsigned char>(text[i]);
         if (!(std::isalnum(ch) || ch == '_' || ch == ':' || ch == '.' || ch == '-' || ch == '/')) {
@@ -230,13 +243,21 @@ bool plausibleBlockName(const char* text) {
 bool readBlockName(void* blockLegacy, std::string& result) {
     if (!blockLegacy || !isReadableAddress(blockLegacy)) return false;
 
-    // Layout used by the 2026 Bedrock SDK we already validated enough for the
-    // block catalog on 1.26.4501.0. We try several known string locations and
-    // fail open if none is plausible.
-    constexpr std::array<std::size_t, 4> stringOffsets = {0x08, 0xE8, 0x98, 0x30};
     char buffer[256]{};
 
-    for (const auto offset : stringOffsets) {
+    // PRIMARY SOURCE: exact 1.26.4501.0 field from the uploaded MineXRayCore.hpp.
+    if (copyMsvcString(
+            reinterpret_cast<std::uint8_t*>(blockLegacy) + ox::BlockLegacy_fullNamespacedName,
+            buffer,
+            sizeof(buffer))
+        && plausibleBlockName(buffer)) {
+        result.assign(buffer);
+        return true;
+    }
+
+    // Diagnostic fallbacks only. The HPP field above is always preferred.
+    constexpr std::array<std::size_t, 4> fallbackOffsets = {0x08, 0xE8, 0x98, 0x30};
+    for (const auto offset : fallbackOffsets) {
         if (copyMsvcString(reinterpret_cast<std::uint8_t*>(blockLegacy) + offset, buffer, sizeof(buffer))
             && plausibleBlockName(buffer)) {
             result.assign(buffer);
@@ -261,7 +282,6 @@ std::vector<int> parsePattern(const char* text) {
     while (*p) {
         while (*p == ' ') ++p;
         if (!*p) break;
-
         if (*p == '?') {
             result.push_back(-1);
             ++p;
@@ -323,7 +343,6 @@ std::vector<std::uint8_t*> findPatterns(
 ) {
     std::vector<std::uint8_t*> matches;
     if (!start || pattern.empty() || size < pattern.size()) return matches;
-
     for (std::size_t i = 0; i + pattern.size() <= size && matches.size() < limit; ++i) {
         bool match = true;
         for (std::size_t j = 0; j < pattern.size(); ++j) {
@@ -354,7 +373,6 @@ std::vector<std::uintptr_t> findWritablePointers(std::uintptr_t target, std::siz
     std::vector<std::uintptr_t> results;
     SYSTEM_INFO si{};
     GetSystemInfo(&si);
-
     auto cursor = reinterpret_cast<std::uintptr_t>(si.lpMinimumApplicationAddress);
     const auto maxAddress = reinterpret_cast<std::uintptr_t>(si.lpMaximumApplicationAddress);
     constexpr std::size_t chunkSize = 1024 * 1024;
@@ -363,9 +381,9 @@ std::vector<std::uintptr_t> findWritablePointers(std::uintptr_t target, std::siz
     while (cursor < maxAddress && results.size() < limit) {
         MEMORY_BASIC_INFORMATION mbi{};
         if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &mbi, sizeof(mbi))) break;
-
         const auto regionBase = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
         const auto regionSize = static_cast<std::size_t>(mbi.RegionSize);
+
         if (mbi.State == MEM_COMMIT && isWritableProtection(mbi.Protect) && regionSize >= sizeof(std::uintptr_t)) {
             std::size_t offset = 0;
             while (offset < regionSize && results.size() < limit) {
@@ -414,7 +432,6 @@ void** findBlockLegacyVtable() {
         }
     }
 
-    // MSVC x64 RTTI fallback: .?AVBlockLegacy@@ -> TypeDescriptor -> COL -> vtable[-1].
     constexpr char rttiName[] = ".?AVBlockLegacy@@";
     std::uint8_t* nameAddress = nullptr;
     for (std::size_t i = 0; i + sizeof(rttiName) <= rdataSize; ++i) {
@@ -489,64 +506,11 @@ bool followedByFloatGetter(std::uint8_t* function, std::size_t getterLength) {
     while (i < 64 && (function[i] == 0xCC || function[i] == 0x90)) ++i;
     if (i + 9 >= 80) return false;
 
-    if (function[i] == 0xF3 && function[i + 1] == 0x0F && function[i + 2] == 0x10
-        && function[i + 3] == 0x81 && function[i + 8] == 0xC3) {
-        return true;
-    }
-    if (function[i] == 0xF3 && function[i + 1] == 0x0F && function[i + 2] == 0x10
-        && function[i + 3] == 0x41 && function[i + 5] == 0xC3) {
-        return true;
-    }
-    return false;
-}
-
-std::vector<void*> collectLiveBlockLegacyObjects(void** vtable) {
-    std::vector<void*> objects;
-    if (!vtable) return objects;
-
-    const auto hits = findWritablePointers(reinterpret_cast<std::uintptr_t>(vtable), 96);
-    for (const auto address : hits) {
-        std::string name;
-        auto* object = reinterpret_cast<void*>(address);
-        if (readBlockName(object, name)) {
-            objects.push_back(object);
-            if (objects.size() >= 32) break;
-        }
-    }
-
-    logLine("[+] Valid live BlockLegacy objects: %zu", objects.size());
-    for (std::size_t i = 0; i < std::min<std::size_t>(objects.size(), 8); ++i) {
-        std::string name;
-        if (readBlockName(objects[i], name)) logLine("    %p -> %s", objects[i], name.c_str());
-    }
-    return objects;
-}
-
-int scoreRenderLayerField(std::int32_t fieldOffset, const std::vector<void*>& objects) {
-    if (objects.empty()) return 0;
-
-    int score = 0;
-    int valid = 0;
-    int bad = 0;
-    std::set<int> distinct;
-    for (void* object : objects) {
-        std::int32_t value = 0;
-        if (!safeReadInt32(reinterpret_cast<std::uint8_t*>(object) + fieldOffset, value)) continue;
-        ++valid;
-        if (value >= 0 && value <= 31) {
-            score += 3;
-            distinct.insert(value);
-        } else {
-            ++bad;
-            score -= 8;
-        }
-    }
-
-    if (valid >= 4) score += 4;
-    if (distinct.size() >= 2) score += 12;
-    if (distinct.size() >= 3) score += 6;
-    if (bad == 0 && valid >= 6) score += 6;
-    return score;
+    return function[i] == 0xF3
+        && function[i + 1] == 0x0F
+        && function[i + 2] == 0x10
+        && ((function[i + 3] == 0x81 && function[i + 8] == 0xC3)
+            || (function[i + 3] == 0x41 && function[i + 5] == 0xC3));
 }
 
 std::uint8_t* findRenderLayerGetter() {
@@ -559,21 +523,11 @@ std::uint8_t* findRenderLayerGetter() {
     const auto exactPattern = parsePattern(
         "8B 81 ?? ?? ?? ?? C3 CC CC CC CC CC CC CC CC CC F3 0F 10 81");
     const auto exactMatches = findPatterns(text, textSize, exactPattern, 32);
-    logLine("[+] Historical getRenderLayer signature matches: %zu", exactMatches.size());
+    logLine("[+] Historical getRenderLayer exact matches: %zu", exactMatches.size());
 
     if (g_blockLegacyVtable) {
-        const auto liveObjects = collectLiveBlockLegacyObjects(g_blockLegacyVtable);
+        std::vector<std::pair<std::size_t, std::uint8_t*>> pairedCandidates;
 
-        struct Candidate {
-            std::uint8_t* function = nullptr;
-            std::size_t index = 0;
-            std::int32_t field = -1;
-            int score = -9999;
-            bool pairedFloat = false;
-            bool exact = false;
-        };
-
-        std::vector<Candidate> candidates;
         for (std::size_t index = 0; index < 384; ++index) {
             auto* function = reinterpret_cast<std::uint8_t*>(safeReadPointer(g_blockLegacyVtable + index));
             if (!addressInSection(function, text, textSize)) break;
@@ -582,41 +536,45 @@ std::uint8_t* findRenderLayerGetter() {
             std::size_t getterLength = 0;
             if (!decodeSimpleIntGetter(function, field, getterLength)) continue;
 
-            Candidate c{};
-            c.function = function;
-            c.index = index;
-            c.field = field;
-            c.pairedFloat = followedByFloatGetter(function, getterLength);
-            c.exact = std::find(exactMatches.begin(), exactMatches.end(), function) != exactMatches.end();
-            c.score = scoreRenderLayerField(field, liveObjects);
-            if (c.pairedFloat) c.score += 35;
-            if (c.exact) c.score += 80;
-            if (index == 180) c.score += 20;
-            candidates.push_back(c);
+            if (std::find(exactMatches.begin(), exactMatches.end(), function) != exactMatches.end()) {
+                g_renderLayerVtableIndex = index;
+                g_renderLayerFieldOffset = field;
+                logLine("[+] getRenderLayer exact vtable match: slot=%zu field=+0x%X fn=%p",
+                        index, static_cast<unsigned>(field), function);
+                return function;
+            }
+
+            if (followedByFloatGetter(function, getterLength)) {
+                pairedCandidates.emplace_back(index, function);
+                logLine("    render-like getter: slot=%zu field=+0x%X fn=%p",
+                        index, static_cast<unsigned>(field), function);
+            }
         }
 
-        std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
-            return a.score > b.score;
-        });
-
-        for (std::size_t i = 0; i < std::min<std::size_t>(candidates.size(), 8); ++i) {
-            const auto& c = candidates[i];
-            logLine("    getter slot=%zu field=+0x%X score=%d exact=%s pair=%s fn=%p",
-                    c.index, static_cast<unsigned>(c.field), c.score,
-                    c.exact ? "yes" : "no", c.pairedFloat ? "yes" : "no", c.function);
+        constexpr std::size_t historicalIndex = 180;
+        auto* historical = reinterpret_cast<std::uint8_t*>(safeReadPointer(g_blockLegacyVtable + historicalIndex));
+        std::int32_t field = -1;
+        std::size_t getterLength = 0;
+        if (addressInSection(historical, text, textSize)
+            && decodeSimpleIntGetter(historical, field, getterLength)
+            && followedByFloatGetter(historical, getterLength)) {
+            g_renderLayerVtableIndex = historicalIndex;
+            g_renderLayerFieldOffset = field;
+            logLine("[+] getRenderLayer validated at historical slot 180: field=+0x%X fn=%p",
+                    static_cast<unsigned>(field), historical);
+            return historical;
         }
 
-        if (!candidates.empty()) {
-            const auto& best = candidates.front();
-            const int secondScore = candidates.size() > 1 ? candidates[1].score : -9999;
-            const bool strong = best.exact || best.pairedFloat || best.index == 180;
-            const bool separated = best.score >= secondScore + 10;
-            if (strong && (separated || best.exact)) {
-                g_renderLayerVtableIndex = best.index;
-                g_renderLayerFieldOffset = best.field;
-                logLine("[+] getRenderLayer selected: slot=%zu field=+0x%X score=%d",
-                        best.index, static_cast<unsigned>(best.field), best.score);
-                return best.function;
+        if (pairedCandidates.size() == 1) {
+            const auto [index, function] = pairedCandidates.front();
+            std::int32_t uniqueField = -1;
+            std::size_t uniqueLength = 0;
+            if (decodeSimpleIntGetter(function, uniqueField, uniqueLength)) {
+                g_renderLayerVtableIndex = index;
+                g_renderLayerFieldOffset = uniqueField;
+                logLine("[+] getRenderLayer selected from unique structural pair: slot=%zu field=+0x%X",
+                        index, static_cast<unsigned>(uniqueField));
+                return function;
             }
         }
     }
@@ -626,7 +584,7 @@ std::uint8_t* findRenderLayerGetter() {
         std::size_t getterLength = 0;
         if (decodeSimpleIntGetter(exactMatches.front(), field, getterLength)) {
             g_renderLayerFieldOffset = field;
-            logLine("[+] getRenderLayer accepted from unique exact signature: field=+0x%X",
+            logLine("[+] getRenderLayer accepted from unique executable signature: field=+0x%X",
                     static_cast<unsigned>(field));
             return exactMatches.front();
         }
@@ -652,13 +610,11 @@ int __fastcall hookedRenderLayer(void* blockLegacy) {
     if (!readBlockName(blockLegacy, identifier)) return originalLayer;
     if (shouldRemainVisible(identifier)) return originalLayer;
 
-    // Same render-layer behavior used by Horion/Borion XRay.
     return 10;
 }
 
 bool installRenderLayerPatch() {
     if (g_renderLayerPatch.installed) return true;
-
     auto* target = findRenderLayerGetter();
     if (!target) return false;
 
@@ -672,11 +628,11 @@ bool installRenderLayerPatch() {
 
     std::array<std::uint8_t, 12> patch{};
     patch[0] = 0x48;
-    patch[1] = 0xB8; // mov rax, imm64
+    patch[1] = 0xB8;
     const auto hookAddress = reinterpret_cast<std::uintptr_t>(&hookedRenderLayer);
     std::memcpy(patch.data() + 2, &hookAddress, sizeof(hookAddress));
     patch[10] = 0xFF;
-    patch[11] = 0xE0; // jmp rax
+    patch[11] = 0xE0;
 
     DWORD oldProtect = 0;
     if (!VirtualProtect(target, patch.size(), PAGE_EXECUTE_READWRITE, &oldProtect)) {
@@ -715,65 +671,94 @@ void uninstallRenderLayerPatch() {
     logLine("[+] getRenderLayer hook removed");
 }
 
-int scoreClientCandidate(std::uint8_t* candidate) {
-    if (!candidate || !isReadableRange(candidate, 0x1E0)) return -1;
-    int score = 0;
-
-    constexpr std::array<std::size_t, 5> offsets = {0x1A0, 0x1A8, 0x1B8, 0x1C8, 0x1D8};
-    for (const auto offset : offsets) {
-        void* value = safeReadPointer(candidate + offset);
-        if (value && isReadableAddress(value)) score += (offset == 0x1B8 ? 4 : 2);
-    }
-    return score;
+std::uintptr_t exactClientVtableAddress() {
+    return reinterpret_cast<std::uintptr_t>(g_minecraft) + ox::ClientInstance_vtable_RVA;
 }
 
-void* findClientInstance() {
-    if (g_clientInstance && isReadableAddress(g_clientInstance)) return g_clientInstance;
+bool validateClientVtable(std::uintptr_t vtableAddress) {
+    if (!vtableAddress || !isReadableRange(reinterpret_cast<void*>(vtableAddress),
+        (ox::ClientInstance_getLevelRenderer + 1) * sizeof(void*))) {
+        return false;
+    }
 
     std::size_t textSize = 0;
     auto* text = getSection(g_minecraft, ".text", textSize);
-    if (!text) return nullptr;
+    if (!text) return false;
 
-    constexpr const char* clientVtablePattern =
-        "48 8D 05 ?? ?? ?? ?? 49 89 45 00 48 8D 05 ?? ?? ?? ?? 49 89 45 18 "
-        "48 8D 05 ?? ?? ?? ?? 49 89 85 ?? ?? ?? ?? 48 8D 05 ?? ?? ?? ?? 49 89 85 ?? ?? ?? ??";
+    auto** table = reinterpret_cast<void**>(vtableAddress);
+    void* getRegion = safeReadPointer(table + ox::ClientInstance_getRegion);
+    void* getLocalPlayer = safeReadPointer(table + ox::ClientInstance_getLocalPlayer);
+    void* getLevelRenderer = safeReadPointer(table + ox::ClientInstance_getLevelRenderer);
+    return addressInSection(getRegion, text, textSize)
+        && addressInSection(getLocalPlayer, text, textSize)
+        && addressInSection(getLevelRenderer, text, textSize);
+}
 
-    auto* match = findPattern(text, textSize, parsePattern(clientVtablePattern));
-    if (!match) {
-        logLine("[!] ClientInstance vtable signature not found");
+void* findClientInstance() {
+    const auto exactVtable = exactClientVtableAddress();
+    if (g_clientInstance && safeReadPointer(g_clientInstance) == reinterpret_cast<void*>(exactVtable)) {
+        return g_clientInstance;
+    }
+
+    if (!validateClientVtable(exactVtable)) {
+        logLine("[!] Exact HPP ClientInstance vtable RVA 0x%llX did not validate",
+                static_cast<unsigned long long>(ox::ClientInstance_vtable_RVA));
         return nullptr;
     }
 
-    const auto clientVtable = resolveRip(match, 3, 7);
-    const auto hits = findWritablePointers(clientVtable, 16);
-    logLine("[+] ClientInstance vtable=0x%llX, pointer hits=%zu",
-            static_cast<unsigned long long>(clientVtable), hits.size());
+    const auto hits = findWritablePointers(exactVtable, 16);
+    logLine("[+] Exact ClientInstance vtable=0x%llX pointer hits=%zu",
+            static_cast<unsigned long long>(exactVtable), hits.size());
 
     int bestScore = -1;
     void* best = nullptr;
     for (const auto address : hits) {
-        auto* candidate = reinterpret_cast<std::uint8_t*>(address);
-        const int score = scoreClientCandidate(candidate);
-        logLine("    candidate=%p score=%d", candidate, score);
+        auto* candidate = reinterpret_cast<void*>(address);
+        if (safeReadPointer(candidate) != reinterpret_cast<void*>(exactVtable)) continue;
+
+        int score = 1;
+        void* levelRenderer = safeCallPtr(candidate, ox::ClientInstance_getLevelRenderer);
+        if (levelRenderer && isReadableAddress(levelRenderer)) score += 10;
+
+        void* region = safeCallPtr(candidate, ox::ClientInstance_getRegion);
+        if (region && isReadableAddress(region)) {
+            score += 10;
+            const auto expectedBlockSourceVtable = reinterpret_cast<void*>(
+                reinterpret_cast<std::uintptr_t>(g_minecraft) + ox::BlockSource_vtable_RVA);
+            if (safeReadPointer(region) == expectedBlockSourceVtable) score += 30;
+        }
+
+        void* player = safeCallPtr(candidate, ox::ClientInstance_getLocalPlayer);
+        if (player && isReadableRange(player, static_cast<std::size_t>(ox::Actor_level) + sizeof(void*))) {
+            score += 10;
+            void* level = safeReadPointer(reinterpret_cast<std::uint8_t*>(player) + ox::Actor_level);
+            if (level && isReadableAddress(level)) {
+                score += 10;
+                const auto expectedLevelVtable = reinterpret_cast<void*>(
+                    reinterpret_cast<std::uintptr_t>(g_minecraft) + ox::Level_vtable_RVA);
+                if (safeReadPointer(level) == expectedLevelVtable) score += 30;
+            }
+        }
+
+        logLine("    CI candidate=%p score=%d", candidate, score);
         if (score > bestScore) {
             bestScore = score;
             best = candidate;
         }
     }
 
-    if (best && bestScore >= 4) {
+    if (best && bestScore >= 11) {
         g_clientInstance = best;
-        logLine("[+] ClientInstance selected: %p score=%d", best, bestScore);
+        logLine("[+] ClientInstance selected from exact HPP validation: %p score=%d", best, bestScore);
         return best;
     }
 
-    logLine("[!] No ClientInstance candidate passed validation");
+    logLine("[!] No ClientInstance candidate passed exact HPP validation");
     return nullptr;
 }
 
 void resolveRebuildFunction() {
     if (g_rebuildChunk) return;
-
     std::size_t textSize = 0;
     auto* text = getSection(g_minecraft, ".text", textSize);
     if (!text) return;
@@ -786,7 +771,7 @@ void resolveRebuildFunction() {
         g_rebuildChunk = reinterpret_cast<RebuildChunkFn>(match);
         logLine("[+] rebuildAllRenderChunkGeometry candidate: %p", match);
     } else {
-        logLine("[!] Chunk rebuild signature not found; inject at menu and enter/re-enter world");
+        logLine("[!] Rebuild signature missing. Re-enter the world after enabling XRay.");
     }
 }
 
@@ -800,8 +785,7 @@ bool safeCallRebuild(void* coordinator) {
         return false;
     }
 #else
-    g_rebuildChunk(coordinator);
-    return true;
+    return false;
 #endif
 }
 
@@ -809,53 +793,62 @@ bool forceChunkRebuild() {
     resolveRebuildFunction();
     if (!g_rebuildChunk) return false;
 
-    auto* client = reinterpret_cast<std::uint8_t*>(findClientInstance());
+    void* client = findClientInstance();
     if (!client) return false;
 
-    // Validated on the user's 1.26.4501.0 live object: ClientInstance+0x1B8
-    // points to a readable LevelRenderer candidate.
-    void* levelRenderer = safeReadPointer(client + 0x1B8);
+    // Exact HPP path: getLevelRenderer is vtable slot 187.
+    void* levelRenderer = safeCallPtr(client, ox::ClientInstance_getLevelRenderer);
     if (!levelRenderer || !isReadableAddress(levelRenderer)) {
-        logLine("[!] ClientInstance+0x1B8 LevelRenderer unavailable");
+        logLine("[!] Exact getLevelRenderer(187) returned no readable object");
         return false;
     }
 
-    // Horion/Borion rebuild path: LevelRenderer+0x20 is the list sentinel,
-    // node+0x18 points to a RenderChunkCoordinator.
+    // The list detail is Borion-derived, not part of MineXRayCore.hpp, so this is
+    // best-effort only. All reads/calls are guarded and failure falls back to re-entering.
     void* sentinel = safeReadPointer(reinterpret_cast<std::uint8_t*>(levelRenderer) + 0x20);
-    if (!sentinel || !isReadableAddress(sentinel)) {
-        logLine("[!] LevelRenderer+0x20 coordinator list unavailable");
+    if (!sentinel || !isReadableRange(sentinel, 0x20)) {
+        logLine("[!] LevelRenderer rebuild list not validated; re-enter world instead");
         return false;
     }
 
     void* node = safeReadPointer(sentinel);
+    if (!node) return false;
+
     std::size_t rebuilt = 0;
     std::size_t iterations = 0;
     while (node && node != sentinel && iterations++ < 512) {
-        if (!isReadableAddress(node)) break;
+        if (!isReadableRange(node, 0x20)) break;
         void* coordinator = safeReadPointer(reinterpret_cast<std::uint8_t*>(node) + 0x18);
         if (coordinator && isReadableAddress(coordinator) && safeCallRebuild(coordinator)) ++rebuilt;
         node = safeReadPointer(node);
     }
 
-    logLine("[+] Chunk rebuild: %zu coordinator(s)", rebuilt);
+    logLine("[+] Chunk rebuild request: %zu coordinator(s)", rebuilt);
     return rebuilt > 0;
 }
 
 void runDiagnostics() {
     logLine("---------------- diagnostics ----------------");
+    logLine("HPP exact: CI slots region=%zu localPlayer=%zu levelRenderer=%zu",
+            ox::ClientInstance_getRegion,
+            ox::ClientInstance_getLocalPlayer,
+            ox::ClientInstance_getLevelRenderer);
+    logLine("HPP exact: BlockLegacy fullName=+0x%llX Block->legacy=+0x%llX",
+            static_cast<unsigned long long>(ox::BlockLegacy_fullNamespacedName),
+            static_cast<unsigned long long>(ox::Block_blockLegacy));
     logLine("hook=%s xray=%s field=0x%X vslot=%s",
             g_renderLayerPatch.installed ? "installed" : "missing",
             g_xrayEnabled.load() ? "ON" : "OFF",
             static_cast<unsigned>(g_renderLayerFieldOffset),
             g_renderLayerVtableIndex == static_cast<std::size_t>(-1) ? "unknown" : "resolved");
+
     if (!g_renderLayerPatch.installed) installRenderLayerPatch();
     findClientInstance();
     resolveRebuildFunction();
     logLine("---------------------------------------------");
 }
 
-void setXray(bool enabled, bool rebuild) {
+void setXray(bool enabled) {
     if (enabled && !g_renderLayerPatch.installed) {
         if (!installRenderLayerPatch()) {
             logLine("[-] XRAY cannot enable: getRenderLayer unresolved");
@@ -866,17 +859,18 @@ void setXray(bool enabled, bool rebuild) {
 
     g_xrayEnabled.store(enabled, std::memory_order_relaxed);
     logLine("[+] XRAY %s", enabled ? "ON" : "OFF");
+    logLine("[i] If already inside a world, press F8 or leave/re-enter the world so chunks rebuild.");
     Beep(enabled ? 900 : 500, 90);
-    if (rebuild) forceChunkRebuild();
 }
 
 DWORD WINAPI workerThread(void*) {
     openLog();
     logLine("============================================================");
-    logLine("MineDLL / MineXRay - internal Bedrock XRay");
-    logLine("Target: Minecraft Bedrock 1.26.4501.0 / 26.45 x64");
-    logLine("Method: BlockLegacy::getRenderLayer hook (Horion/Borion style)");
-    logLine("F6 toggle | F7 diagnostics | F8 rebuild chunks | F12 unload");
+    logLine("MineDLL / MineXRay - HPP-backed Bedrock XRay");
+    logLine("Target: Minecraft Bedrock 1.26.4501.0 / 26.45.1 x64");
+    logLine("Using uploaded MineXRayCore.hpp exact 1.26.4501.0 offsets");
+    logLine("Core XRay method: BlockLegacy::getRenderLayer hook (Horion/Borion style)");
+    logLine("F6 toggle | F7 diagnostics | F8 best-effort chunk rebuild | F12 unload");
 
     g_minecraft = GetModuleHandleW(L"Minecraft.Windows.exe");
     if (!g_minecraft) {
@@ -893,18 +887,23 @@ DWORD WINAPI workerThread(void*) {
     Sleep(800);
 
     if (installRenderLayerPatch()) {
-        setXray(true, true);
+        // Do not force an unvalidated rebuild on startup. Inject on the main menu,
+        // then enter the world so chunks are first-built with XRay already active.
+        setXray(true);
     } else {
-        logLine("[-] Initial hook failed. Press F7 to write detailed diagnostics.");
+        logLine("[-] Initial hook failed. F7 writes detailed resolver diagnostics.");
         Beep(250, 180);
     }
 
     while (true) {
-        if (GetAsyncKeyState(VK_F6) & 1) {
-            setXray(!g_xrayEnabled.load(std::memory_order_relaxed), true);
-        }
+        if (GetAsyncKeyState(VK_F6) & 1) setXray(!g_xrayEnabled.load(std::memory_order_relaxed));
         if (GetAsyncKeyState(VK_F7) & 1) runDiagnostics();
-        if (GetAsyncKeyState(VK_F8) & 1) forceChunkRebuild();
+        if (GetAsyncKeyState(VK_F8) & 1) {
+            if (!forceChunkRebuild()) {
+                logLine("[i] F8 could not validate rebuild chain. Leave and re-enter the world.");
+                Beep(350, 80);
+            }
+        }
         if (GetAsyncKeyState(VK_F12) & 1) break;
         Sleep(30);
     }
@@ -912,8 +911,6 @@ DWORD WINAPI workerThread(void*) {
     logLine("[+] Unloading MineXRay");
     g_unloading.store(true, std::memory_order_relaxed);
     g_xrayEnabled.store(false, std::memory_order_relaxed);
-    forceChunkRebuild();
-    Sleep(200);
     uninstallRenderLayerPatch();
 
     if (g_log) {
